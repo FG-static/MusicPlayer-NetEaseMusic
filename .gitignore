@@ -1,0 +1,9 @@
+downloaded_music/
+*.mp3
+cache/
+*.pyc
+.vscode/
+learn/
+dist/
+build/
+__pycache__/
