@@ -5,16 +5,25 @@ import sys
 import os
 import pygame
 import random
+import json
 
 from music_crawler import get_playlist_music, download_music, get_music, get_cookie, get_lyrics
 
 # 注意，复制cookie时需要用原始模式下复制，否则会产生'...'截断
 COOKIE = get_cookie()
 DEFAULT_DOWNLOAD_FOLDER = "downloaded_music"
+DEFAULT_SAVE_FOLDER = "cache"
 
 class MusDownloadGUI:
     # 构造函数=初始化方法
     def __init__(self, root): # self就是实例本身，类似于this，root为窗口根节点
+        # 检查文件夹
+        if not os.path.exists(DEFAULT_DOWNLOAD_FOLDER + "//temp"):
+            os.makedirs(DEFAULT_DOWNLOAD_FOLDER + "//temp", exist_ok = True)
+            print(f"Create: {DEFAULT_DOWNLOAD_FOLDER + "//temp"}")
+        if not os.path.exists(DEFAULT_SAVE_FOLDER):
+            os.makedirs(DEFAULT_SAVE_FOLDER, exist_ok = True)
+            print(f"Create: {DEFAULT_SAVE_FOLDER}")
         self.root = root
         self.root.title("NetEaseMusic")
         self.root.geometry("1200x800") # 窗口大小
@@ -42,6 +51,8 @@ class MusDownloadGUI:
         self.mode_type = self.REPEAT_ALL
         self.mode_text = ["Repeat All", "Single Repeat", "Random"]
         self.setup_ui() 
+        # 加载播放列表
+        self.load_playlist_from_local()
     
     # 创建用户图形界面
     def setup_ui(self):
@@ -157,8 +168,10 @@ class MusDownloadGUI:
         self.add_all_button.pack(side = tk.LEFT, padx = 5)
 
         # 删除歌曲
-        self.del_btn = tk.Button(list_frame, text = "Delete from Playlist ↓", command = self.delete_from_playlist)
-        self.del_btn.pack(pady = 5)
+        self.del_btn1 = tk.Button(list_frame, text = "Delete from Playlist ↓", command = self.delete_from_playlist)
+        self.del_btn1.pack(pady = 5)
+        self.del_btn2 = tk.Button(list_frame, text = "Clear Playlist", command = self.delete_all_playlist)
+        self.del_btn2.pack(pady = 5)
 
         # 播放模式调节
         self.switch_button = tk.Button(play_frame, text = self.mode_text[self.mode_type], command = self.switch_playmode)
@@ -277,7 +290,10 @@ class MusDownloadGUI:
     # 退出程序
     def exit(self):
         res = messagebox.askyesno(title = "Confirm to exit", message = "Really want to exit the application?")
-        if res: self.root.destroy()
+        if res:
+            # 保存播放列表
+            self.save_playlist_to_local() 
+            self.root.destroy()
 
     #下载歌曲
     def perform_download(self, song):
@@ -549,6 +565,55 @@ class MusDownloadGUI:
             self.cur_index -= 1
             
         self.update_status(f"Removed: {song_name}")
+
+    def delete_all_playlist(self):
+        if not self.playlist:
+            messagebox.showinfo("Clear Info", "The playlist is empty")
+            return
+        # 误触
+        if messagebox.askyesno("Confirm", "Really want to clear the playlist?"):
+            self.playlist.clear()
+            self.playlist_listbox.delete(0, tk.END)
+            
+            self.cur_index = -1
+                
+            self.update_status(f"Removed all songs in playlist")
+
+    # 保存播放列表
+    def save_playlist_to_local(self):
+        try:
+            # 只保存必要的歌曲信息，减少体积
+            save_data = []
+            for song in self.playlist:
+                save_data.append({
+                    'name': song.get('name'),
+                    'id': song.get('id'),
+                    'artist': song.get('artist'),
+                    'album': song.get('album'),
+                    'length': song.get('length'),
+                    'is_cloud': song.get('is_cloud')
+                })
+            with open(DEFAULT_SAVE_FOLDER + "//playlist_config.json", "w", encoding = "utf-8") as f:
+                json.dump(save_data, f, ensure_ascii = False, indent = 4)
+        except Exception as e:
+            print(f"Failed to save playlist: {e}")
+    
+    # 从本地加载到播放列表
+    def load_playlist_from_local(self):
+        if os.path.exists(DEFAULT_SAVE_FOLDER + "//playlist_config.json"):
+            try:
+                with open(DEFAULT_SAVE_FOLDER + "//playlist_config.json", "r", encoding = "utf-8") as f:
+                    loaded_data = json.load(f)
+                    self.playlist = loaded_data
+                    
+                    # 更新到 Listbox 界面
+                    for song in self.playlist:
+                        artists = ", ".join(song['artist'])
+                        self.playlist_listbox.insert(tk.END, f"{song['name']} - {artists}")
+                        
+                self.update_status(f"Had loaded {len(self.playlist)} historical songs")
+            except Exception as e:
+                print(f"Failed to load playlist: {e}")
 
     def switch_playmode(self):
         # 切换模式索引 0->1->2->0
