@@ -3,11 +3,37 @@ from tkinter import ttk, messagebox
 import threading
 import sys
 import os
+import subprocess
 import pygame
 import random
 import json
 
+# try importing vlc; requires VLC desktop installed and libvlc.dll on PATH
+# if import fails we also probe typical installation folders and retry
+_VLC_AVAILABLE = False
+try:
+    import vlc
+    _VLC_AVAILABLE = True
+except Exception as _vlc_err:
+    # attempt to add common installation directory to PATH
+    for p in [r"C:\Program Files\VideoLAN\VLC", r"C:\Program Files (x86)\VideoLAN\VLC"]:
+        if os.path.isdir(p):
+            os.environ['PATH'] = p + os.pathsep + os.environ.get('PATH', '')
+    try:
+        import vlc
+        _VLC_AVAILABLE = True
+        _vlc_err = None
+    except Exception as _vlc_err2:
+        _vlc_err = _vlc_err2
+    if not _VLC_AVAILABLE:
+        vlc = None
+        _VLC_ERROR = str(_vlc_err)
+
 from music_crawler import get_playlist_music, download_music, get_music, get_cookie, get_lyrics
+import shutil
+
+# check ffmpeg presence for conversion fallback
+_FFMPEG_AVAILABLE = shutil.which('ffmpeg') is not None
 
 # 注意，复制cookie时需要用原始模式下复制，否则会产生'...'截断
 COOKIE = get_cookie()
@@ -28,8 +54,23 @@ class MusDownloadGUI:
         self.root.title("NetEaseMusic")
         self.root.geometry("1200x800") # 窗口大小
         self.songs_list = [] # 储存搜索列表
+        # display VLC/ffmpeg warning if needed
+        if not _VLC_AVAILABLE and not _FFMPEG_AVAILABLE:
+            self.root.after(100, lambda: self.update_status(
+                "No VLC or ffmpeg available; playback of some MP3s may fail."
+            ))
+        elif not _VLC_AVAILABLE:
+            self.root.after(100, lambda: self.update_status(
+                f"VLC not available: {_VLC_ERROR}. install VLC or add libvlc.dll to PATH"
+            ))
+        elif not _FFMPEG_AVAILABLE:
+            self.root.after(100, lambda: self.update_status(
+                "ffmpeg not found, some MP3 may not play. Install ffmpeg or VLC."
+            ))
         # 在线播放
         pygame.mixer.init() # 初始化播放器
+        self.vlc_player = None  # VLC 播放器实例，初始为空
+        self.is_using_vlc = False  # 当前是否使用 VLC
         self.is_playing = False
         self.cur_song = None # 记录歌曲url
         self.pause = False
@@ -269,22 +310,16 @@ class MusDownloadGUI:
         if (not selection1 and not selection2):
             messagebox.showwarning("Selection Error", "Please select a song")
             return
-        selection = 0
-        wait_songs_list = []
-        if (not selection1):
-            selection = selection2
-            wait_songs_list = self.playlist
+        if selection1:
+            song_index = selection1[0]
+            selected_song = self.songs_list[song_index]
         else:
-            selection = selection1
-            wait_songs_list = self.songs_list
-        song_index = selection[0]
-        selected_song = wait_songs_list[song_index]
-        # selected_song.get('name', 'Unknown song')表示尝试获取name的键值，如果获取失败则返回默认值
+            song_index = selection2[0]
+            selected_song = self.playlist[song_index]
         self.update_status(f"Prepare to download: {selected_song.get('name', 'Unknown song')}")
 
-        # 分离新线程
         download_thread = threading.Thread(target = self.perform_download, args = (selected_song,))
-        download_thread.daemon = True # 结束程序时强制结束该线程
+        download_thread.daemon = True
         download_thread.start()
 
     # 退出程序
@@ -299,7 +334,7 @@ class MusDownloadGUI:
     def perform_download(self, song):
         try:
             if_cloud = song['is_cloud']
-            success = download_music(song['id'], song['name'], COOKIE, DEFAULT_DOWNLOAD_FOLDER, if_cloud)
+            success = download_music(song['id'], song['name'], COOKIE, DEFAULT_DOWNLOAD_FOLDER)
             if success:
                 self.root.after(0, lambda: self.update_status(f"Successed to download: {song['name']}"))
             else:
@@ -319,16 +354,13 @@ class MusDownloadGUI:
         if (not selection1 and not selection2):
             messagebox.showwarning("Selection Error", "Please select a song")
             return
-        selection = 0
-        wait_songs_list = []
-        if (not selection1):
-            selection = selection2
-            wait_songs_list = self.playlist
-        else:
-            selection = selection1
+        if selection1:
+            song_index = selection1[0]
             wait_songs_list = self.songs_list
-        song_index = selection[0]
-        if (song_index >= len(self.songs_list)):
+        else:
+            song_index = selection2[0]
+            wait_songs_list = self.playlist
+        if song_index >= len(wait_songs_list):
             return
         selected_song = wait_songs_list[song_index]
 
@@ -338,6 +370,52 @@ class MusDownloadGUI:
         play_thread.daemon = True
         play_thread.start()
 
+    def _set_vlc_volume(self, vol):
+        """设置 VLC 音量（0-100）"""
+        if self.vlc_player is not None:
+            try:
+                result = self.vlc_player.audio_set_volume(vol)
+                print(f"[_set_vlc_volume] vol={vol}, result={result}")
+            except Exception as e:
+                print(f"[_set_vlc_volume] error: {e}")
+        else:
+            print(f"[_set_vlc_volume] vlc_player=None")
+    
+    def _play_with_vlc(self, audio_path):
+        """使用 VLC 作为后备播放器"""
+        try:
+            self.vlc_player = vlc.MediaPlayer(audio_path)
+            self.vlc_player.play()
+            self.is_using_vlc = True
+            # 设置初始音量（延迟确保播放器已初始化）
+            vol = int(self.volume_scale.get())
+            self.root.after(100, lambda v=vol: self._set_vlc_volume(v))
+            self.root.after(0, self.playing_start)
+        except Exception as e:
+            self.root.after(0, lambda: self.update_status(f"VLC play error: {e}"))
+            self.root.after(0, self.playing_stop)
+    
+    def _stop_all_players(self):
+        """停止所有正在运行的播放器（VLC + pygame）"""
+        # 停止 VLC 播放器
+        if self.vlc_player is not None:
+            try:
+                self.vlc_player.stop()
+            except Exception:
+                pass
+            try:
+                del self.vlc_player
+            except Exception:
+                pass
+            self.vlc_player = None
+        # 停止 pygame 播放器
+        try:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+        except Exception:
+            pass
+        self.is_using_vlc = False
+    
     # 如果不自动获取id则后两项参数无需填写
     # 否则第二项参数为整首歌信息，第四项参数为时长
     def play_song(self, song_index, auto_get_id = False, song_len = 0): 
@@ -345,9 +423,9 @@ class MusDownloadGUI:
         # 临时文件，方便播放音乐
         temp_path = os.path.join(DEFAULT_DOWNLOAD_FOLDER + "//temp", "__TEMP_PREVIEW__.mp3")
         try:
-            pygame.mixer.music.stop()  # 停止当前播放
-            pygame.mixer.music.unload()  # 卸载当前音乐
-    
+            # 停止任何正在运行的播放
+            self._stop_all_players()
+            
             wait_songs_list = []
             selection1 = self.results_listbox.curselection()
             selection2 = self.playlist_listbox.curselection()
@@ -366,18 +444,54 @@ class MusDownloadGUI:
             self.drag_offset = 0 # 清空偏移
             self.progress_var.set(0)
             # 下载临时文件
-            if_cloud = song_data['is_cloud']
             self.update_name_label(song_data['name'])
-            download_music(song_id, "__TEMP_PREVIEW__", COOKIE, DEFAULT_DOWNLOAD_FOLDER + "//temp", if_cloud)
-            
+            # remove existing preview if any
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            success = download_music(song_id, "__TEMP_PREVIEW__", COOKIE, DEFAULT_DOWNLOAD_FOLDER + "//temp")
+            if not success or not os.path.exists(temp_path):
+                self.root.after(0, lambda: self.update_status("Failed to download song."))
+                self.root.after(0, self.playing_stop)
+                return
             # 获取歌词
             self.cur_lyrics_dict = get_lyrics(song_id)
             self.lyric_times = sorted(self.cur_lyrics_dict.keys())
 
-            # 加载并播放
-            pygame.mixer.music.load(temp_path)  # 加载本地临时文件
+            # 首选使用 pygame 播放
+            self.is_using_vlc = False
+            try:
+                pygame.mixer.music.load(temp_path)
+            except pygame.error as e:
+                # pygame 加载失败，尝试 ffmpeg 转换
+                if _FFMPEG_AVAILABLE:
+                    tmpwav = temp_path + ".wav"
+                    try:
+                        subprocess.run(["ffmpeg", "-y", "-i", temp_path, tmpwav],
+                                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        pygame.mixer.music.load(tmpwav)
+                    except Exception:
+                        # ffmpeg 转换失败，尝试 VLC
+                        if _VLC_AVAILABLE:
+                            self.root.after(0, lambda: self.update_status(f"pygame/ffmpeg failed, trying VLC"))
+                            self._play_with_vlc(temp_path)
+                            return
+                        else:
+                            self.root.after(0, lambda: self.update_status(f"Playing Error: {e}"))
+                            self.root.after(0, self.playing_stop)
+                            return
+                elif _VLC_AVAILABLE:
+                    # 没有 ffmpeg，直接用 VLC
+                    self.root.after(0, lambda: self.update_status(f"pygame failed, trying VLC"))
+                    self._play_with_vlc(temp_path)
+                    return
+                else:
+                    self.root.after(0, lambda: self.update_status(f"Playing Error: {e}"))
+                    self.root.after(0, self.playing_stop)
+                    return
             pygame.mixer.music.play()
-            
             # 更新状态到主线程
             self.root.after(0, self.playing_start)
             
@@ -398,66 +512,115 @@ class MusDownloadGUI:
     
     def pause_song(self):
         if (not self.is_playing): return
-        if (self.pause):
-            pygame.mixer.music.unpause()
+        if self.is_using_vlc and self.vlc_player is not None:
+            try:
+                if self.pause:
+                    self.vlc_player.play()
+                else:
+                    self.vlc_player.pause()
+            except Exception:
+                pass
+        else:
+            # pygame 暂停
+            try:
+                if self.pause:
+                    pygame.mixer.music.unpause()
+                else:
+                    pygame.mixer.music.pause()
+            except Exception:
+                pass
+        
+        if self.pause:
             self.pause = False
             self.pause_button.config(text = "Pause")
             self.update_status("Continue to play")
         else:
-            pygame.mixer.music.pause()
             self.pause = True
             self.pause_button.config(text = "Continue")
             self.update_status("Pause to play")
     
     def stop_song(self):
-        pygame.mixer.music.stop()
+        self._stop_all_players()
         self.playing_stop()
         self.cur_lyrics_dict = {}
         self.lrc_label.config(text = "🚫无歌词", fg = "gray")
         self.update_status("Playing had been stopped")
 
     def playing_stop(self):
+        self._stop_all_players()
         self.is_playing = False
-        self.paused = False
+        self.pause = False
         self.play_button.config(state = tk.NORMAL)
         self.pause_button.config(state = tk.DISABLED, text = "Pause")
         self.stop_button.config(state = tk.DISABLED)
 
     def volume_changing(self, val):
-        volume = int(val) / 100.0
-        pygame.mixer.music.set_volume(volume)
+        volume = int(val)  # 0-100 从滑块直接读取
+        if self.is_using_vlc and self.vlc_player is not None:
+            # 调用 VLC 音量设置
+            self._set_vlc_volume(volume)
+        else:
+            # pygame 音量（0-1 范围）
+            try:
+                pygame.mixer.music.set_volume(volume / 100.0)
+            except Exception:
+                pass
 
     def update_progress(self):
         if (not self.is_changing): # 未拖拽
-            # 自动切歌
-            if self.is_playing and not pygame.mixer.music.get_busy() and not self.pause:
+            # 检查是否需要自动切歌
+            if self.is_using_vlc and self.vlc_player is not None:
+                # VLC 播放器
+                try:
+                    # VLC 的进度跟踪比较困难，简化处理
+                    # 尽量使用可用的数据
+                    current_time = self.vlc_player.get_time() if hasattr(self.vlc_player, 'get_time') else 0
+                    current_pos_offset = current_time / 1000.0 + self.drag_offset
+                    if current_pos_offset > self.song_length / 1000.0:
+                        current_pos_offset = self.song_length / 1000.0
+                    if self.song_length > 0:
+                        progress_val = current_pos_offset * 1000000 / self.song_length
+                        self.progress_var.set(progress_val)
+                    self.update_time_label(current_pos_offset, self.song_length)
+                    # 更新歌词
+                    if hasattr(self, 'cur_lyrics_dict') and self.cur_lyrics_dict:
+                        current_lrc = None
+                        for t in self.lyric_times:
+                            if t <= current_pos_offset:
+                                current_lrc = self.cur_lyrics_dict[t]
+                            else:
+                                break
+                        if current_lrc:
+                            self.lrc_label.config(text=current_lrc, fg="black")
+                except Exception:
+                    pass
+            elif self.is_playing and pygame.mixer.music.get_busy():
+                # pygame 播放器 - 原有逻辑
+                # 自动切歌
+                if not self.pause:
+                    current_pos = pygame.mixer.music.get_pos()
+                    current_pos_offset = current_pos / 1000.0 + self.drag_offset
+                    if current_pos_offset > self.song_length / 1000.0:
+                        current_pos_offset = self.song_length / 1000.0
+                        if not self.pause:
+                            self.auto_next_song()
+                    if self.song_length > 0:
+                        progress_val = current_pos_offset * 1000000 / self.song_length
+                        self.progress_var.set(progress_val)
+                    self.update_time_label(current_pos_offset, self.song_length)
+                    if hasattr(self, 'cur_lyrics_dict') and self.cur_lyrics_dict:
+                        current_lrc = None
+                        for t in self.lyric_times:
+                            if t <= current_pos_offset:
+                                current_lrc = self.cur_lyrics_dict[t]
+                            else:
+                                break
+                        if current_lrc:
+                            self.lrc_label.config(text=current_lrc, fg="black")
+            elif self.is_playing and not pygame.mixer.music.get_busy() and not self.pause:
+                # pygame 播放器已结束
                 self.auto_next_song()
-            # 均表示正在播放
-            if (self.is_playing and pygame.mixer.music.get_busy()):
-                current_pos = pygame.mixer.music.get_pos()
-                current_pos_offset = current_pos / 1000.0 + self.drag_offset
-                if current_pos_offset > self.song_length / 1000.0:
-                    current_pos_offset = self.song_length / 1000.0
-                if (self.song_length > 0):
-                    progress_val = current_pos_offset * 1000000 / self.song_length
-                    self.progress_var.set(progress_val)
-                # 分:秒
-                self.update_time_label(current_pos_offset, self.song_length)
-                # 更新歌词
-                # 从字典中查找当前秒数对应的歌词
-                if hasattr(self, 'cur_lyrics_dict') and self.cur_lyrics_dict:
-                    current_lrc = None
-                    # 遍历找到当前时间应该显示的最后一句歌词
-                    for t in self.lyric_times:
-                        if t <= current_pos_offset:
-                            current_lrc = self.cur_lyrics_dict[t]
-                        else:
-                            # 因为是排序的，一旦时间超过当前时间，后面的都不用看了
-                            break
-                    # 只有当找到歌词且内容不为空时才更新
-                    if current_lrc:
-                        self.lrc_label.config(text=current_lrc, fg="black")
-        # 每隔0.125s自调用
+        # 每隔125ms自调用
         self.root.after(125, self.update_progress)
     
     def update_time_label(self, cpo, sl):
